@@ -8,6 +8,10 @@ const MemoryStore = require('memorystore')(session);
 const axios = require('axios');
 const crypto = require('crypto');
 
+// Increase max listeners to prevent memory leak warnings from axios/TLS sockets
+const EventEmitter = require('events');
+EventEmitter.defaultMaxListeners = 50;
+
 const wallet = require('./wallet');
 
 // Import selfbot to stop bots on key revocation
