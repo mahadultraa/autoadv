@@ -1,6 +1,10 @@
 const axios = require('axios');
 const WebSocket = require('ws');
 
+// Increase max listeners to prevent memory leak warnings
+const EventEmitter = require('events');
+EventEmitter.defaultMaxListeners = 50;
+
 // Track active bot instances: { userId_configId: { ws, channels, message, ... } }
 const activeBots = new Map();
 
@@ -61,6 +65,8 @@ class DiscordSelfBot {
         this.botUserId = null;
         this.guildChannels = new Map();
         this.botKey = `${userId}_${configId}`;
+        this.connectionTimeout = null;
+        this.readyCheckInterval = null;
 
         // Load previously replied users from database
         this.loadRepliedUsers();
@@ -99,14 +105,18 @@ class DiscordSelfBot {
         });
 
         this.ws.on('message', (data) => {
-            const payload = JSON.parse(data);
-            this.handlePayload(payload);
+            try {
+                const payload = JSON.parse(data);
+                this.handlePayload(payload);
+            } catch (e) {
+                console.error(`[SELFBOT ${this.configId}] Error parsing message:`, e.message);
+            }
         });
 
         this.ws.on('close', (code) => {
             console.log(`[SELFBOT ${this.configId}] WebSocket closed: ${code}`);
             this.isRunning = false;
-            if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+            this.cleanupConnection();
         });
 
         this.ws.on('error', (err) => {
@@ -114,15 +124,37 @@ class DiscordSelfBot {
         });
 
         return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('Connection timeout')), 30000);
-            const checkReady = setInterval(() => {
+            this.connectionTimeout = setTimeout(() => {
+                this.cleanupConnection();
+                reject(new Error('Connection timeout'));
+            }, 30000);
+
+            this.readyCheckInterval = setInterval(() => {
                 if (this.isRunning) {
-                    clearTimeout(timeout);
-                    clearInterval(checkReady);
+                    this.cleanupConnectionTimers();
                     resolve();
                 }
             }, 500);
         });
+    }
+
+    cleanupConnectionTimers() {
+        if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+            this.connectionTimeout = null;
+        }
+        if (this.readyCheckInterval) {
+            clearInterval(this.readyCheckInterval);
+            this.readyCheckInterval = null;
+        }
+    }
+
+    cleanupConnection() {
+        this.cleanupConnectionTimers();
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
+        }
     }
 
     handlePayload(payload) {
@@ -194,6 +226,13 @@ class DiscordSelfBot {
                     this.handleDM(data);
                 }
                 break;
+
+            case 'CHANNEL_CREATE':
+                // Handle new DM channel creation for auto-reply
+                if (this.autoReply && d && d.type === 1 && d.recipients) {
+                    console.log(`[SELFBOT ${this.configId}] New DM channel created: ${d.id}`);
+                }
+                break;
         }
     }
 
@@ -204,16 +243,21 @@ class DiscordSelfBot {
         // Don't reply to bot messages or system messages
         if (data.author.bot || data.author.system) return;
 
-        // Don't reply to group DMs (channel type 3)
+        // Don't reply to group DMs (channel type 3) - check guildChannels as fallback
         if (data.channel_type === 3) return;
+        if (this.guildChannels.has(data.channel_id)) return;
 
         // Only reply once per user - check memory AND persist to DB
         if (this.repliedUsers.has(data.author.id)) {
             return;
         }
 
-        // Send auto-reply
+        // Send auto-reply with random delay to seem human
+        const delay = 1000 + Math.random() * 2000;
         setTimeout(() => {
+            // Double-check we haven't replied during the delay
+            if (this.repliedUsers.has(data.author.id)) return;
+
             this.sendDM(data.channel_id, this.autoReplyText).then(() => {
                 this.repliedUsers.add(data.author.id);
                 // Persist so we never reply to this user again, even after restart
@@ -222,7 +266,7 @@ class DiscordSelfBot {
             }).catch(err => {
                 console.error(`[SELFBOT ${this.configId}] Auto-reply failed:`, err.message);
             });
-        }, 1000 + Math.random() * 2000); // Random 1-3s delay to seem human
+        }, delay);
     }
 
     async sendDM(channelId, content) {
@@ -239,6 +283,11 @@ class DiscordSelfBot {
     }
 
     identify() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            console.error(`[SELFBOT ${this.configId}] Cannot identify: WebSocket not open`);
+            return;
+        }
+
         const payload = {
             op: 2,
             d: {
@@ -255,7 +304,7 @@ class DiscordSelfBot {
                     afk: false
                 },
                 compress: false,
-                intents: 512 // GUILD_MESSAGES (512) for message events
+                intents: 4608 // GUILD_MESSAGES (512) + DIRECT_MESSAGES (4096) = 4608
             }
         };
         this.ws.send(JSON.stringify(payload));
@@ -394,16 +443,17 @@ class DiscordSelfBot {
     stop() {
         console.log(`[SELFBOT ${this.configId}] Stopping...`);
         this.isRunning = false;
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
-        }
+        this.cleanupConnection();
         if (this.messageTimer) {
             clearTimeout(this.messageTimer);
             this.messageTimer = null;
         }
         if (this.ws) {
-            try { this.ws.close(); } catch (e) {}
+            try {
+                if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+                    this.ws.close();
+                }
+            } catch (e) {}
             this.ws = null;
         }
     }
