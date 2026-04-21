@@ -1,10 +1,6 @@
 const axios = require('axios');
 const WebSocket = require('ws');
 
-// Increase max listeners to prevent memory leak warnings
-const EventEmitter = require('events');
-EventEmitter.defaultMaxListeners = 50;
-
 // Track active bot instances: { userId_configId: { ws, channels, message, ... } }
 const activeBots = new Map();
 
@@ -65,8 +61,14 @@ class DiscordSelfBot {
         this.botUserId = null;
         this.guildChannels = new Map();
         this.botKey = `${userId}_${configId}`;
-        this.connectionTimeout = null;
-        this.readyCheckInterval = null;
+
+        // Reconnection state
+        this.explicitStop = false;
+        this.reconnectAttempts = 0;
+        this.reconnectTimeout = null;
+        this.maxReconnectAttempts = 50; // Very high - essentially never gives up
+        this.baseReconnectDelay = 2000;
+        this.maxReconnectDelay = 30000;
 
         // Load previously replied users from database
         this.loadRepliedUsers();
@@ -96,8 +98,64 @@ class DiscordSelfBot {
         }
     }
 
+    getReconnectDelay() {
+        const delay = Math.min(
+            this.baseReconnectDelay * Math.pow(1.5, this.reconnectAttempts),
+            this.maxReconnectDelay
+        );
+        return delay + Math.random() * 1000; // Add jitter
+    }
+
+    scheduleReconnect() {
+        if (this.explicitStop) {
+            console.log(`[SELFBOT ${this.configId}] Explicit stop - not reconnecting`);
+            return;
+        }
+
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+            console.log(`[SELFBOT ${this.configId}] Max reconnect attempts reached. Will keep trying anyway...`);
+            this.reconnectAttempts = 0; // Reset and keep trying
+        }
+
+        const delay = this.getReconnectDelay();
+        this.reconnectAttempts++;
+
+        console.log(`[SELFBOT ${this.configId}] Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
+
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+        }
+
+        this.reconnectTimeout = setTimeout(() => {
+            if (!this.explicitStop) {
+                this.connect().catch(err => {
+                    console.error(`[SELFBOT ${this.configId}] Reconnect failed:`, err.message);
+                    this.scheduleReconnect();
+                });
+            }
+        }, delay);
+    }
+
     async connect() {
+        // Check if access was revoked before connecting
+        if (this.db) {
+            const userData = this.db.getUser(this.userId);
+            if (userData && userData.key_revoked) {
+                console.log(`[SELFBOT ${this.configId}] Access revoked for user ${this.userId}, not reconnecting`);
+                this.explicitStop = true;
+                this.isRunning = false;
+                return Promise.reject(new Error('Access revoked'));
+            }
+        }
+
         const gatewayUrl = 'wss://gateway.discord.gg/?v=9&encoding=json';
+
+        // Close existing socket if any
+        if (this.ws) {
+            try { this.ws.terminate(); } catch (e) {}
+            this.ws = null;
+        }
+
         this.ws = new WebSocket(gatewayUrl);
 
         this.ws.on('open', () => {
@@ -109,52 +167,58 @@ class DiscordSelfBot {
                 const payload = JSON.parse(data);
                 this.handlePayload(payload);
             } catch (e) {
-                console.error(`[SELFBOT ${this.configId}] Error parsing message:`, e.message);
+                console.error(`[SELFBOT ${this.configId}] Failed to parse message:`, e.message);
             }
         });
 
-        this.ws.on('close', (code) => {
-            console.log(`[SELFBOT ${this.configId}] WebSocket closed: ${code}`);
+        this.ws.on('close', (code, reason) => {
+            const reasonStr = reason ? reason.toString() : 'no reason';
+            console.log(`[SELFBOT ${this.configId}] WebSocket closed: code=${code}, reason=${reasonStr}`);
             this.isRunning = false;
-            this.cleanupConnection();
+            if (this.heartbeatInterval) {
+                clearInterval(this.heartbeatInterval);
+                this.heartbeatInterval = null;
+            }
+
+            // Only stop permanently for specific reasons
+            if (this.explicitStop) {
+                console.log(`[SELFBOT ${this.configId}] Stopped by user, no reconnect`);
+                return;
+            }
+
+            // 4004 = authentication failed (invalid token)
+            if (code === 4004) {
+                console.error(`[SELFBOT ${this.configId}] Authentication failed (invalid token), stopping permanently`);
+                this.explicitStop = true;
+                return;
+            }
+
+            // 4001 = unknown opcode, 4002 = decode error, 4008 = rate limited, 4009 = session timeout
+            // All other codes should trigger reconnect
+            this.scheduleReconnect();
         });
 
         this.ws.on('error', (err) => {
             console.error(`[SELFBOT ${this.configId}] WebSocket error:`, err.message);
+            // Don't stop here - let on('close') handle reconnection
         });
 
         return new Promise((resolve, reject) => {
-            this.connectionTimeout = setTimeout(() => {
-                this.cleanupConnection();
-                reject(new Error('Connection timeout'));
+            const timeout = setTimeout(() => {
+                if (!this.isRunning) {
+                    reject(new Error('Connection timeout'));
+                }
             }, 30000);
 
-            this.readyCheckInterval = setInterval(() => {
+            const checkReady = setInterval(() => {
                 if (this.isRunning) {
-                    this.cleanupConnectionTimers();
+                    clearTimeout(timeout);
+                    clearInterval(checkReady);
+                    this.reconnectAttempts = 0; // Reset on successful connection
                     resolve();
                 }
             }, 500);
         });
-    }
-
-    cleanupConnectionTimers() {
-        if (this.connectionTimeout) {
-            clearTimeout(this.connectionTimeout);
-            this.connectionTimeout = null;
-        }
-        if (this.readyCheckInterval) {
-            clearInterval(this.readyCheckInterval);
-            this.readyCheckInterval = null;
-        }
-    }
-
-    cleanupConnection() {
-        this.cleanupConnectionTimers();
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
-        }
     }
 
     handlePayload(payload) {
@@ -175,13 +239,38 @@ class DiscordSelfBot {
                 this.sendHeartbeat();
                 break;
             case 7: // Reconnect
-                console.log(`[SELFBOT ${this.configId}] Reconnect requested`);
+                console.log(`[SELFBOT ${this.configId}] Reconnect requested by Discord`);
+                if (this.ws) {
+                    try { this.ws.close(); } catch (e) {}
+                }
+                this.scheduleReconnect();
                 break;
             case 9: // Invalid session
-                console.log(`[SELFBOT ${this.configId}] Invalid session`);
-                setTimeout(() => this.identify(), 5000);
+                console.log(`[SELFBOT ${this.configId}] Invalid session, d=${d}`);
+                // d=false means unresumable, d=true means resumable
+                if (d === false) {
+                    this.sessionId = null;
+                    this.sequence = null;
+                    setTimeout(() => this.identify(), 5000);
+                } else {
+                    // Try to resume
+                    this.resume();
+                }
                 break;
         }
+    }
+
+    resume() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        const payload = {
+            op: 6,
+            d: {
+                token: this.token,
+                session_id: this.sessionId,
+                seq: this.sequence
+            }
+        };
+        this.ws.send(JSON.stringify(payload));
     }
 
     handleDispatch(eventType, data) {
@@ -226,13 +315,6 @@ class DiscordSelfBot {
                     this.handleDM(data);
                 }
                 break;
-
-            case 'CHANNEL_CREATE':
-                // Handle new DM channel creation for auto-reply
-                if (this.autoReply && d && d.type === 1 && d.recipients) {
-                    console.log(`[SELFBOT ${this.configId}] New DM channel created: ${d.id}`);
-                }
-                break;
         }
     }
 
@@ -243,21 +325,16 @@ class DiscordSelfBot {
         // Don't reply to bot messages or system messages
         if (data.author.bot || data.author.system) return;
 
-        // Don't reply to group DMs (channel type 3) - check guildChannels as fallback
+        // Don't reply to group DMs (channel type 3)
         if (data.channel_type === 3) return;
-        if (this.guildChannels.has(data.channel_id)) return;
 
         // Only reply once per user - check memory AND persist to DB
         if (this.repliedUsers.has(data.author.id)) {
             return;
         }
 
-        // Send auto-reply with random delay to seem human
-        const delay = 1000 + Math.random() * 2000;
+        // Send auto-reply
         setTimeout(() => {
-            // Double-check we haven't replied during the delay
-            if (this.repliedUsers.has(data.author.id)) return;
-
             this.sendDM(data.channel_id, this.autoReplyText).then(() => {
                 this.repliedUsers.add(data.author.id);
                 // Persist so we never reply to this user again, even after restart
@@ -266,7 +343,7 @@ class DiscordSelfBot {
             }).catch(err => {
                 console.error(`[SELFBOT ${this.configId}] Auto-reply failed:`, err.message);
             });
-        }, delay);
+        }, 1000 + Math.random() * 2000); // Random 1-3s delay to seem human
     }
 
     async sendDM(channelId, content) {
@@ -283,11 +360,6 @@ class DiscordSelfBot {
     }
 
     identify() {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            console.error(`[SELFBOT ${this.configId}] Cannot identify: WebSocket not open`);
-            return;
-        }
-
         const payload = {
             op: 2,
             d: {
@@ -304,13 +376,17 @@ class DiscordSelfBot {
                     afk: false
                 },
                 compress: false,
-                intents: 4608 // GUILD_MESSAGES (512) + DIRECT_MESSAGES (4096) = 4608
+                intents: 512 // GUILD_MESSAGES (512) for message events
             }
         };
         this.ws.send(JSON.stringify(payload));
     }
 
     startHeartbeat(interval) {
+        // Clear any existing heartbeat
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+        }
         this.heartbeatInterval = setInterval(() => {
             this.sendHeartbeat();
         }, interval);
@@ -325,6 +401,12 @@ class DiscordSelfBot {
     // ============ CHANNEL MESSAGING ============
 
     startMessaging() {
+        // Clear any existing message timer
+        if (this.messageTimer) {
+            clearTimeout(this.messageTimer);
+            this.messageTimer = null;
+        }
+
         console.log(`[SELFBOT ${this.configId}] Starting messaging loop: ${this.channels.length} channels, delay: ${this.delayMs}ms, all-at-once: ${this.sendAllAtOnce}`);
 
         if (this.sendAllAtOnce) {
@@ -375,8 +457,8 @@ class DiscordSelfBot {
                 console.log(`[SELFBOT ${this.configId}] Rate limited on ${channelId}, waiting ${retryAfter}ms`);
                 await new Promise(r => setTimeout(r, retryAfter));
             } else if (err.response?.status === 401) {
-                console.error(`[SELFBOT ${this.configId}] Token invalid for ${channelId}`);
-                this.stop();
+                console.error(`[SELFBOT ${this.configId}] Token invalid for ${channelId} - stopping permanently`);
+                this.stopPermanently();
             } else {
                 console.error(`[SELFBOT ${this.configId}] Send error to ${channelId}:`, err.response?.status, err.message);
             }
@@ -440,20 +522,46 @@ class DiscordSelfBot {
         }
     }
 
-    stop() {
-        console.log(`[SELFBOT ${this.configId}] Stopping...`);
+    stopPermanently() {
+        console.log(`[SELFBOT ${this.configId}] Stopping permanently`);
+        this.explicitStop = true;
         this.isRunning = false;
-        this.cleanupConnection();
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
+        }
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
+        }
         if (this.messageTimer) {
             clearTimeout(this.messageTimer);
             this.messageTimer = null;
         }
         if (this.ws) {
-            try {
-                if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
-                    this.ws.close();
-                }
-            } catch (e) {}
+            try { this.ws.terminate(); } catch (e) {}
+            this.ws = null;
+        }
+    }
+
+    stop() {
+        console.log(`[SELFBOT ${this.configId}] Stopping (user requested)...`);
+        this.explicitStop = true;
+        this.isRunning = false;
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
+        }
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
+        }
+        if (this.messageTimer) {
+            clearTimeout(this.messageTimer);
+            this.messageTimer = null;
+        }
+        if (this.ws) {
+            try { this.ws.close(); } catch (e) {}
             this.ws = null;
         }
     }
@@ -481,7 +589,10 @@ async function startSelfBot(userId, token, channels, message, delayMs, autoReply
         return { success: true, username: 'connected' };
     } catch (err) {
         console.error(`[SELFBOT] Failed to start ${botKey}:`, err.message);
-        activeBots.delete(botKey);
+        // If it's not an explicit stop, keep the bot in the map so it keeps reconnecting
+        if (bot.explicitStop) {
+            activeBots.delete(botKey);
+        }
         throw err;
     }
 }
@@ -504,7 +615,9 @@ function getBotStatus(userId, configId) {
         messageCount: bot.messageCount,
         autoReply: bot.autoReply,
         autoReplyText: bot.autoReplyText,
-        repliedUsersCount: bot.repliedUsers.size
+        repliedUsersCount: bot.repliedUsers.size,
+        reconnectAttempts: bot.reconnectAttempts,
+        explicitStop: bot.explicitStop
     };
 }
 
@@ -515,7 +628,8 @@ function getUserBots(userId) {
             bots.push({
                 configId: bot.configId,
                 isRunning: bot.isRunning,
-                messageCount: bot.messageCount
+                messageCount: bot.messageCount,
+                reconnectAttempts: bot.reconnectAttempts
             });
         }
     }
